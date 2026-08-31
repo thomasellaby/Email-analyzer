@@ -36,6 +36,14 @@ python email_security_analyzer.py analyze --eml suspicious.eml --vt-api-key YOUR
 # or set the key via environment variable:
 export VT_API_KEY=YOUR_KEY
 python email_security_analyzer.py analyze --eml suspicious.eml
+
+# Only trust Authentication-Results headers stamped by your own mail gateway
+# (repeatable flag; otherwise SPF/DKIM/DMARC results are self-reported and
+# can be forged by whoever supplied the message -- see "Header trust" below)
+python email_security_analyzer.py analyze --eml suspicious.eml --trusted-authserv mx.google.com
+# or set via environment variable (comma-separated):
+export TRUSTED_AUTHSERV=mx.google.com,mail.protection.outlook.com
+python email_security_analyzer.py analyze --eml suspicious.eml
 ```
 
 `--headers` mode only runs the header checks (no body/URL/attachment
@@ -44,7 +52,10 @@ content available); `--eml` mode runs the full pipeline.
 ## What it checks
 
 ### Headers
-- SPF / DKIM / DMARC results parsed from `Authentication-Results`
+- SPF / DKIM / DMARC results parsed from `Authentication-Results`, with
+  trust-boundary checking (see [Header trust](#header-trust-authentication-results)
+  below) and detection of **conflicting Authentication-Results headers**
+  (a strong sign one was forged/injected)
 - `Reply-To`, `Return-Path`, `Sender`, and `Message-ID` domain mismatches
   against the visible `From` domain
 - Display-name brand impersonation (e.g. `"PayPal Support"` sent from a
@@ -118,11 +129,35 @@ can quickly verify the reasoning rather than trust a black-box score.
 ## Output formats
 
 - **Human-readable text** (default): summary block (subject, from,
-  reply-to, attachment count, SPF/DKIM/DMARC results, total score,
-  verdict) followed by findings sorted by severity.
+  reply-to, attachment count, SPF/DKIM/DMARC results, the `authserv-id`
+  the results came from and whether it was trusted, total score, verdict)
+  followed by findings sorted by severity.
 - **JSON** (`--json`): same data as a structured object —
   `meta`, `total_score`, `verdict`, `verdict_description`, `findings[]`
-  — suitable for piping into other tooling or a SIEM.
+  — suitable for piping into other tooling or a SIEM. `meta` includes
+  `authserv_id` and `authserv_trusted` alongside the `*_result` fields.
+
+## Header trust (Authentication-Results)
+
+`Authentication-Results` is only meaningful when it was stamped by the
+receiving organization's own boundary mail server (its `authserv-id`,
+per RFC 8601). Anyone who controls the raw message — including the
+sender's own outbound mail infrastructure, or someone hand-editing a
+`.eml`/`headers.txt` file — can prepend a header of the exact same name
+claiming `spf=pass; dkim=pass; dmarc=pass`, and nothing about the header
+name or format distinguishes a forged block from a genuine one.
+
+By default (no `--trusted-authserv` configured), the tool treats all
+`Authentication-Results` blocks as **self-reported**: `fail`/`softfail`
+still contribute to the risk score (at reduced weight), but `pass` no
+longer suppresses risk — it's surfaced as an informational note instead.
+Pass `--trusted-authserv HOSTNAME` (repeatable, or `TRUSTED_AUTHSERV` as
+a comma-separated env var) with the hostname(s) of your own mail
+gateway to restore full-confidence scoring for headers that actually
+match a trusted `authserv-id`. Regardless of configuration, if a message
+carries multiple `Authentication-Results` headers that disagree on the
+same mechanism (e.g. one says `spf=fail`, another says `spf=pass`), that
+conflict is always flagged as a high-severity finding on its own.
 
 ## Limitations
 
@@ -132,7 +167,9 @@ can quickly verify the reasoning rather than trust a black-box score.
   VirusTotal lookup is opt-in and hash-based (no upload of file content).
 - SPF/DKIM/DMARC verification relies on the `Authentication-Results`
   header already present in the source (the tool does not perform its
-  own DNS-based SPF/DKIM validation).
+  own DNS-based SPF/DKIM validation) — see
+  [Header trust](#header-trust-authentication-results) for how forged
+  headers are handled and how to configure trusted `authserv-id` values.
 - Heuristic scoring is a decision aid, not a guarantee — always apply
   analyst judgment before acting on the verdict (e.g. blocking a sender
   or deleting mail).
