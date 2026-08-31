@@ -299,7 +299,21 @@ def extract_plain_urls(text: str) -> list:
 # Header analysis
 # --------------------------------------------------------------------------
 
-def analyze_headers(msg: Message, report: Report) -> None:
+AUTH_RESULT_MECHS = ("spf", "dkim", "dmarc")
+
+
+def _parse_auth_results_header(value: str) -> tuple:
+    """Split one Authentication-Results header into (authserv-id, {mech: result})."""
+    authserv_id = value.split(";", 1)[0].strip()
+    results = {}
+    for mech in AUTH_RESULT_MECHS:
+        m = re.search(rf"{mech}=(\w+)", value, re.I)
+        if m:
+            results[mech] = m.group(1).lower()
+    return authserv_id, results
+
+
+def analyze_headers(msg: Message, report: Report, trusted_authserv: Optional[list] = None) -> None:
     from_hdr = msg.get("From", "")
     reply_to = msg.get("Reply-To", "")
     return_path = msg.get("Return-Path", "")
@@ -387,25 +401,94 @@ def analyze_headers(msg: Message, report: Report) -> None:
         )
 
     # --- Authentication-Results (SPF/DKIM/DMARC) ---
+    # NOTE: Authentication-Results is only trustworthy when it was stamped by the
+    # receiving organization's own boundary MTA (RFC 8601 "authserv-id"). Anyone who
+    # controls the raw message -- including the attacker's own sending infrastructure,
+    # or an analyst hand-editing a .eml/headers.txt -- can prepend a header of this
+    # exact same name claiming spf=pass/dkim=pass/dmarc=pass. Without an allowlist of
+    # authserv-id values that belong to a trusted receiving system, a "pass" here is
+    # self-reported, not verified, and must not be allowed to silently cancel out a
+    # forged/failing result added elsewhere in the same header block.
     auth_results = msg.get_all("Authentication-Results", []) or []
-    auth_blob = " ".join(auth_results)
-    if auth_blob:
-        for mech in ("spf", "dkim", "dmarc"):
-            m = re.search(rf"{mech}=(\w+)", auth_blob, re.I)
-            if m:
-                result = m.group(1).lower()
-                report.meta[f"{mech}_result"] = result
-                if result in ("fail", "softfail"):
+    trusted_authserv = [t.lower().strip() for t in (trusted_authserv or []) if t.strip()]
+
+    def _is_trusted(authserv_id: str) -> bool:
+        aid = authserv_id.lower().strip()
+        return any(aid == t or aid.endswith("." + t) for t in trusted_authserv)
+
+    if auth_results:
+        parsed = [_parse_auth_results_header(v) for v in auth_results]
+        trusted_blocks = [p for p in parsed if trusted_authserv and _is_trusted(p[0])]
+
+        if trusted_authserv and not trusted_blocks:
+            report.add(
+                "headers", "medium", 8, "No Authentication-Results from a trusted mail server",
+                f"Found {len(parsed)} Authentication-Results header(s), but none carry an "
+                f"authserv-id matching the configured trusted list ({', '.join(trusted_authserv)}). "
+                "Results in an untrusted header can be forged by anyone who controls the raw "
+                "message and should not be relied upon.",
+            )
+
+        # A forged block sitting alongside the genuine one is itself a strong signal --
+        # flag disagreement regardless of which block ends up being used for scoring.
+        by_mech: dict = {}
+        for authserv_id, results in parsed:
+            for mech, result in results.items():
+                by_mech.setdefault(mech, set()).add(result)
+        for mech, result_set in by_mech.items():
+            if len(result_set) > 1:
+                report.add(
+                    "headers", "high", 16,
+                    f"Conflicting {mech.upper()} results across Authentication-Results headers",
+                    f"Message carries multiple Authentication-Results headers reporting different "
+                    f"{mech}= outcomes ({', '.join(sorted(result_set))}). This is consistent with "
+                    "an attacker injecting a forged 'pass' block alongside, or in place of, the "
+                    "genuine result added by the receiving server.",
+                )
+
+        if trusted_blocks:
+            authserv_id, results = trusted_blocks[0]
+            confidence = "high"
+        else:
+            authserv_id, results = parsed[0]
+            confidence = "low"
+
+        report.meta["authserv_id"] = authserv_id
+        report.meta["authserv_trusted"] = bool(trusted_blocks)
+
+        for mech in AUTH_RESULT_MECHS:
+            result = results.get(mech)
+            if not result:
+                continue
+            report.meta[f"{mech}_result"] = result
+            if result in ("fail", "softfail"):
+                if confidence == "high":
                     report.add(
                         "headers", "high", 14, f"{mech.upper()} authentication failed",
-                        f"Authentication-Results reports {mech}={result}. The sending server "
-                        "failed to authenticate for this domain, a strong spoofing signal.",
+                        f"Authentication-Results ({authserv_id}) reports {mech}={result}. The "
+                        "sending server failed to authenticate for this domain, a strong "
+                        "spoofing signal.",
                     )
-                elif result in ("none", "neutral", "temperror", "permerror"):
+                else:
                     report.add(
-                        "headers", "low", 5, f"{mech.upper()} authentication inconclusive ({result})",
-                        f"Authentication-Results reports {mech}={result}. Not conclusive on its own.",
+                        "headers", "medium", 7, f"{mech.upper()} authentication failed (unverified source)",
+                        f"Authentication-Results ({authserv_id}) reports {mech}={result}, but this "
+                        "header's authserv-id is not on the trusted list, so it cannot be tied to "
+                        "a real mail server -- treated as a weaker signal.",
                     )
+            elif result in ("none", "neutral", "temperror", "permerror"):
+                report.add(
+                    "headers", "low", 5, f"{mech.upper()} authentication inconclusive ({result})",
+                    f"Authentication-Results ({authserv_id}) reports {mech}={result}. Not conclusive "
+                    "on its own.",
+                )
+            elif result == "pass" and confidence == "low":
+                report.add(
+                    "headers", "info", 0, f"{mech.upper()}=pass reported by unverified source",
+                    f"Authentication-Results ({authserv_id}) reports {mech}=pass, but no trusted "
+                    "authserv-id was configured for comparison, so this cannot be treated as proof "
+                    "of legitimacy -- it may have been forged by whoever supplied this message.",
+                )
     else:
         report.add(
             "headers", "info", 4, "No Authentication-Results header found",
@@ -859,9 +942,14 @@ def analyze_attachments(msg: Message, report: Report, save_dir: Optional[str], v
 # Orchestration
 # --------------------------------------------------------------------------
 
-def analyze_message(msg: Message, save_dir: Optional[str] = None, vt_api_key: Optional[str] = None) -> Report:
+def analyze_message(
+    msg: Message,
+    save_dir: Optional[str] = None,
+    vt_api_key: Optional[str] = None,
+    trusted_authserv: Optional[list] = None,
+) -> Report:
     report = Report()
-    analyze_headers(msg, report)
+    analyze_headers(msg, report, trusted_authserv=trusted_authserv)
     analyze_body(msg, report)
     analyze_attachments(msg, report, save_dir, vt_api_key)
     return report
@@ -903,6 +991,9 @@ def print_human_report(report: Report) -> None:
     for mech in ("spf", "dkim", "dmarc"):
         if f"{mech}_result" in report.meta:
             print(f"{mech.upper():<12}: {report.meta[f'{mech}_result']}")
+    if "authserv_id" in report.meta:
+        trust_note = "trusted" if report.meta.get("authserv_trusted") else "UNVERIFIED"
+        print(f"AuthServID  : {report.meta['authserv_id']} ({trust_note})")
     print(bar)
     print(f"RISK SCORE  : {report.total_score}")
     print(f"VERDICT     : {label}  -  {desc}")
@@ -954,6 +1045,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="VirusTotal API key for optional attachment hash reputation lookups "
              "(defaults to VT_API_KEY env var). Only SHA256 hashes are sent, never file contents.",
     )
+    analyze_p.add_argument(
+        "--trusted-authserv", metavar="HOSTNAME", action="append",
+        default=[h for h in os.environ.get("TRUSTED_AUTHSERV", "").split(",") if h.strip()],
+        help="Hostname (authserv-id) of a mail server you trust to have genuinely performed "
+             "SPF/DKIM/DMARC checks, e.g. mx.google.com. Repeatable. Without this, "
+             "Authentication-Results is self-reported by the message source and can be forged "
+             "by an attacker, so pass/fail results are treated with reduced confidence. Can "
+             "also be set via the comma-separated TRUSTED_AUTHSERV env var.",
+    )
     return parser
 
 
@@ -967,14 +1067,17 @@ def main(argv: Optional[list] = None) -> int:
                 print(f"error: file not found: {args.eml}", file=sys.stderr)
                 return 1
             msg = load_eml(args.eml)
-            report = analyze_message(msg, save_dir=args.save_attachments, vt_api_key=args.vt_api_key)
+            report = analyze_message(
+                msg, save_dir=args.save_attachments, vt_api_key=args.vt_api_key,
+                trusted_authserv=args.trusted_authserv,
+            )
         else:
             if not os.path.isfile(args.headers):
                 print(f"error: file not found: {args.headers}", file=sys.stderr)
                 return 1
             msg = load_headers_only(args.headers)
             report = Report()
-            analyze_headers(msg, report)
+            analyze_headers(msg, report, trusted_authserv=args.trusted_authserv)
             report.add("body", "info", 0, "Body/attachment scan skipped",
                        "Only headers were supplied (--headers mode); body and attachment "
                        "checks require --eml.")
